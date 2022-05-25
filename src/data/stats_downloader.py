@@ -1,16 +1,23 @@
-# Download all available data from official Premier League site
+# Download all available data from https://fbref.com
 # https://github.com/aleksandradabro1997/PLScorePrediction.git
 
-import abc
-import wget
+import logging
 
+import bs4.element
+import requests
 
 from enum import Enum
-from dataclasses import dataclass
-from typing import Optional, List
+from bs4 import BeautifulSoup
+from dataclasses import dataclass, field
+from typing import Optional, List, Union, Tuple, Dict
 
 
-from mappings import SEASON_TO_PAGE_NUMBER, STAT_NAME_TO_PAGE_NAME_CLUB, STAT_NAME_TO_PAGE_NAME_PLAYER
+from mappings import SEASON_TO_PAGE_MATCHES, CLUB_TO_PAGE_STATS
+
+
+# Create logger for stats
+stats_logger = logging.getLogger('StatsLogger')
+stats_logger.setLevel(logging.INFO)
 
 
 class StatsType(Enum):
@@ -20,109 +27,152 @@ class StatsType(Enum):
 
 
 @dataclass
-class PlayerStatsDownloaderConfig:
-    name: str
+class BaseDownloaderConfig:
+    seasons: List[str] = field(default_factory=lambda: ['2021/2022'])  # List with '2021/2022, 2020/2021 ...'
 
 
 @dataclass
-class ClubStatsDownloaderConfig:
-    name: str
+class SpecificStatsDownloaderConfig(BaseDownloaderConfig):
+    stats: List[str] = field(default_factory=lambda: ['all'])  # List with either 'all' or the name of stat
+    names: List[str] = field(default_factory=lambda: ['all'])  # List with either 'all' or the name ex: Watford
 
 
 @dataclass
 class StatsDownloaderConfig:
-    seasons: List[str]     # List with either 'all' or '2021/20, 2020/2019 ...'
-    players: List[PlayerStatsDownloaderConfig]
-    clubs: List[ClubStatsDownloaderConfig]
+    match_results_config: BaseDownloaderConfig = BaseDownloaderConfig()
+    players_stats_config: SpecificStatsDownloaderConfig = SpecificStatsDownloaderConfig()
+    clubs_stats_config: SpecificStatsDownloaderConfig = SpecificStatsDownloaderConfig()
 
 
-PATTERNS = {'player name': '',
-            'club name': '',
-            'stat': '(<td class="mainStat text-centre">)([0-9]*)(</td>)'}
+class MatchResultsDownloader:
+    season_to_url = SEASON_TO_PAGE_MATCHES
+
+    def __init__(self, config: BaseDownloaderConfig):
+        self.config = config
+
+    def _get_url_based_on_season(self, season: str) -> Optional[str]:
+        return self.season_to_url.get(season, None)
+
+    def _get_home_team(self, stats_table: bs4.element.ResultSet) -> List[str]:
+        home_teams = []
+        for elem in stats_table.find_all(class_='right'):
+            if 'data-stat' in elem.attrs.keys() and 'squad_a' == elem.attrs['data-stat']:
+                if any(l.isalpha() for l in elem.text):
+                    home_teams.append(elem.text.lower())
+        return home_teams
+
+    def _get_score(self, stats_table: bs4.element.ResultSet) -> List[str]:
+        scores = []
+        for elem in stats_table.find_all(class_='center'):
+            if 'data-stat' in elem.attrs.keys() and 'score' == elem.attrs['data-stat']:
+                if any(l.isnumeric() for l in elem.text):
+                    scores.append(elem.text.lower())
+        return scores
+
+    def _get_away_team(self, stats_table: bs4.element.ResultSet) -> List[str]:
+        away_team = []
+        for elem in stats_table.find_all(class_='left'):
+            if 'data-stat' in elem.attrs.keys() and 'squad_b' == elem.attrs['data-stat']:
+                if any(l.isalpha() for l in elem.text):
+                    away_team.append(elem.text.lower())
+        return away_team
+
+    def _consolidate_data(self, home_team: List, away_team: List, scores: List) -> Optional[Dict[str, List]]:
+        if not len(home_team) == len(away_team) == len(scores):
+            stats_logger.error('Home team, away team and scores list differ in length!')
+            return None
+        return {'home_team': home_team,
+                'scores': scores,
+                'away_team': away_team}
+
+    def _get_stats_table(self, page: BeautifulSoup):
+        stats_table = page.find_all(class_='stats_table')
+        return stats_table[0]
+
+    def _download_and_parse(self, url: str):
+        response = requests.get(url)
+        if response.status_code != 200:
+            stats_logger.error(f'Unable to download data from page {url}. Got response code: {response.status_code}')
+
+        page_soup = BeautifulSoup(response.text, 'html.parser')
+        stats = self._get_stats_table(page_soup)
+        home_team = self._get_home_team(stats_table=stats)
+        away_team = self._get_away_team(stats_table=stats)
+        score = self._get_score(stats_table=stats)
+
+        matches_dict = self._consolidate_data(home_team, away_team, score)
+        return matches_dict
+
+    def download(self) -> Dict:
+        all_data = {}
+        if 'all' in self.config.seasons:
+            seasons_to_download = self.season_to_url.keys()
+        else:
+            seasons_to_download = self.config.seasons
+
+        for season in seasons_to_download:
+            season_url = self._get_url_based_on_season(season)
+            if not season_url:
+                stats_logger.warning(f'No season {season} available! Skipping ...')
+                continue
+            else:
+                season_data = self._download_and_parse(season_url)
+                all_data[season] = season_data
+        return all_data
 
 
-class BaseStatsDownloader(abc.ABC):
-    url = ''
-    patterns = PATTERNS
-    season_to_number_map = SEASON_TO_PAGE_NUMBER
-    stat_name_to_page_map = None
+class ClubsStatsDownloader:
+    club_to_url = CLUB_TO_PAGE_STATS
 
-    @abc.abstractmethod
-    def download(self):
-        pass
-
-    def stat_to_page(self, stat_name: str) -> str:
-        """
-        Converts name of the statistics to its web subpage.
-        :param stat_name: name of the statistics to download
-        :return: subpage name
-        """
-        return self.stat_name_to_page_map.get(stat_name, None)
-
-    def season_to_number(self, season: str) -> Optional[int]:
-        """
-        Converts season string to number.
-        Example: '2021/22' -> 418
-        https://www.premierleague.com/stats/top/clubs/total_pass?se=418 <- the number at the end corresponds to season
-        :param season: string representing season
-        :return: number corresponding to season
-        """
-        return self.season_to_number_map.get(season, None)
-
-
-class PlayerStatsDownloader(BaseStatsDownloader):
-    """
-    Download all available stats for particular player, that is specified in PlayerStatsConfig.
-    """
-    url = 'https://www.premierleague.com/stats/top/players'
-    available_stats = ['goals', 'assists', 'appearances', 'minutes_played', 'yellow cards', 'red cards',
-                       'substituted on', 'substituted off', 'shots', 'shots on target', 'hit woodwork',
-                       'goals from header', 'goals from penalty', 'goals from freekick', 'offsides', 'touches',
-                       'passes', 'through balls', 'crosses', 'corners taken', 'blocks', 'interceptions', 'tackles',
-                       'last man tackles', 'clearances', 'headed clearances', 'aerial battles won', 'own goals',
-                       'errors leading to goal', 'penalties conceded', 'fouls', 'aerial battles lost', 'clean sheets',
-                       'goals conceded', 'saves', 'penalties saved', 'punches', 'high claims', 'sweeper clearances',
-                       'throw outs', 'goal kicks']
-    stat_name_to_page_map = STAT_NAME_TO_PAGE_NAME_PLAYER
-
-    def download(self):
-        pass
-
-    def _get_named_stat(self, season: str, stat_name: str) -> Optional[int]:
-        season_number = self.season_to_number(season=season)
-        stat_url = '/'.join([self.url])
-        pass
-
-
-class ClubStatsDownloader(BaseStatsDownloader):
-    """
-    Download all available stats for particular player, that is specified in ClubStatsDownloaderConfig.
-    """
-    url = 'https://www.premierleague.com/stats/top/clubs'
-    available_stats = ['wins', 'losses', 'goals', 'yellow cards', 'red_cards', 'substitutions on',
-                       'clean sheets', 'goals conceded', 'saves', 'blocks', 'interceptions', 'tackles',
-                       'last man tackles', 'clearances', 'headed clearances', 'caught opponent offside',
-                       'own goals', 'penalties conceded', 'goals conceded from penalty', 'fouls',
-                       'shots', 'shots on target', 'hit woodwork', 'goals from header', 'goals from penalty',
-                       'goals from freekick', 'goals from inside box', 'goals from outside box',
-                       'goals from counter attack', 'offsides', 'passes', 'through balls', 'long passes',
-                       'backwards passes', 'crosses', 'corners taken']
-    stat_name_to_page_map = STAT_NAME_TO_PAGE_NAME_CLUB
-
-    def download(self):
-        pass
-
-    def _get_named_stat(self, season: str, stat_name: str) -> Optional[int]:
-        season_number = self.season_to_number(season=season)
-        stat_url = '/'.join([self.url])
-        pass
-
-
-class StatsDownloader:
-    """
-    Main downloader class.
-    """
     def __init__(self, config: StatsDownloaderConfig):
         self.config = config
-        self.player_downloader = PlayerStatsDownloader()
-        self.club_downloader = ClubStatsDownloader()
+
+    def _get_url_based_on_clubs_name(self, club: str):
+        return self.club_to_url.get(club, None)
+
+    def _get_and_parse_rows(self, stats_table: bs4.element.Tag) -> List[Dict]:
+        rows = stats_table.find_all('tr')
+        parsed_rows = []
+        for row in rows:
+            cols = row.find_all('td')
+            club_stats_row = {}
+            for col in cols:
+                club_stats_row[col.attrs['data-stat']] = col.getText()
+            parsed_rows.append(club_stats_row)
+        return parsed_rows
+
+    def _get_stats_table(self, page: BeautifulSoup):
+        table = page.find('table', attrs={'id': 'comps_fa_club_league'})
+        table_body = table.find('tbody')
+        return table_body
+
+    def _download_and_parse(self, url: str):
+        response = requests.get(url)
+        if response.status_code != 200:
+            stats_logger.error(f'Unable to download data from page {url}. Got response code: {response.status_code}')
+
+        page_soup = BeautifulSoup(response.text, 'html.parser')
+        stats = self._get_stats_table(page_soup)
+        club_stats = self._get_and_parse_rows(stats_table=stats)
+
+        return club_stats
+
+    def download(self) -> Dict:
+        all_stats = {}
+
+        if 'all' in self.config.clubs_stats_config.names:
+            clubs_to_download = self.club_to_url.keys()
+        else:
+            clubs_to_download = self.config.clubs_stats_config.names
+
+        for club_name in clubs_to_download:
+            club_stats_url = self._get_url_based_on_clubs_name(club=club_name)
+
+            if not club_stats_url:
+                stats_logger.warning(f'No {club_name} stats available! Skipping ...')
+                continue
+            else:
+                club_stats = self._download_and_parse(url=club_stats_url)
+                all_stats[club_name] = club_stats
+
+        return all_stats
