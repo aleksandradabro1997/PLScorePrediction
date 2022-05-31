@@ -176,3 +176,13 @@ class ClubsStatsDownloader:
                 all_stats[club_name] = club_stats
 
         return all_stats
+
+
+if __name__ == '__main__':
+    results_downloader = MatchResultsDownloader(config=BaseDownloaderConfig())
+    results = results_downloader.download()
+
+    club_stats_downloader = ClubsStatsDownloader(config=StatsDownloaderConfig())
+    club_stats = club_stats_downloader.download()
+
+    pass
